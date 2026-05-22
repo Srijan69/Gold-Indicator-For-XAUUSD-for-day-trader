@@ -1,0 +1,713 @@
+// ============================================================
+// XAUUSD DAY TRADER PRO v3 — Fixed & Upgraded
+// ============================================================
+// FIXES in v3:
+//  • Demand zone ALWAYS below supply zone (guaranteed ordering)
+//  • Golden Pocket: arm → wait → confirm → THEN signal fires
+//  • Signals only fire inside London / New York sessions
+//  • Max 3 signals per session (prevents spam)
+//  • 15-bar cooldown between signals
+//  • Trap label: 30-bar cooldown (no more spam)
+//  • EMAs & RSI used internally ONLY — zero lines on chart
+//  • Clean GainzAlgo V2 style: BUY/SELL + green profit box + red risk box
+// ============================================================
+
+//@version=6
+indicator("XAUUSD Day Trader Pro v3",
+     shorttitle        = "XAU v3",
+     overlay           = true,
+     max_lines_count   = 500,
+     max_boxes_count   = 300,
+     max_labels_count  = 300)
+
+// ─────────────────────────────────────────────────────────────
+// ░░  INPUTS
+// ─────────────────────────────────────────────────────────────
+
+g0 = "Session Filter"
+ldn_sess   = input.session("0800-1700", "London Session",   group = g0)
+ny_sess    = input.session("1300-2200", "New York Session", group = g0)
+
+g1 = "4H Bias Settings"
+sr_look    = input.int(50, "4H Lookback (bars)", minval = 20, maxval = 200, group = g1)
+
+g2 = "EMA (Internal — not drawn)"
+ema_f      = input.int(9,   "Fast EMA",  minval = 3,  group = g2)
+ema_m      = input.int(21,  "Mid EMA",   minval = 5,  group = g2)
+ema_s      = input.int(50,  "Slow EMA",  minval = 10, group = g2)
+
+g3 = "RSI (Internal — not drawn)"
+rsi_len    = input.int(14, "RSI Length", group = g3)
+
+g4 = "Fibonacci & Golden Pocket"
+fib_look   = input.int(50,  "Fib Swing Lookback", minval = 20, maxval = 200, group = g4)
+show_gp    = input.bool(true, "Show Golden Pocket Box",  group = g4)
+show_fibs  = input.bool(true, "Show Fib Level Lines",    group = g4)
+gp_confirm_bars = input.int(8, "GP: Max bars to wait for confirmation", minval = 2, maxval = 20, group = g4)
+
+g5 = "Supply & Demand Zones"
+zone_atr_mult = input.float(0.6, "Zone thickness (ATR mult)", minval = 0.1, maxval = 2.0, group = g5)
+
+g6 = "Volume Filter"
+vol_len    = input.int(20,    "Volume MA Length",           group = g6)
+vol_thresh = input.float(1.1, "Min Vol Ratio for signal",   minval = 0.8, maxval = 3.0, group = g6)
+
+g7 = "Risk : Reward & SL"
+rr_mode    = input.string("1:2", "R:R Mode", options = ["1:2", "2:4"], group = g7)
+atr_len    = input.int(14,    "ATR Length",          group = g7)
+atr_sl     = input.float(1.5, "SL = ATR x Mult",     minval = 0.5, maxval = 5.0, group = g7)
+
+g8 = "Signal Control"
+cooldown   = input.int(15, "Min bars between signals",  minval = 5, maxval = 50, group = g8)
+max_per_sess = input.int(3, "Max signals per session",  minval = 1, maxval = 10, group = g8)
+show_boxes = input.bool(true, "Show TP/SL Boxes", group = g8)
+show_sr    = input.bool(true, "Show 4H S&R Lines", group = g8)
+
+// ─────────────────────────────────────────────────────────────
+// ░░  SESSION DETECTION
+// ─────────────────────────────────────────────────────────────
+
+in_ldn     = not na(time(timeframe.period, ldn_sess, "Europe/London"))
+in_ny      = not na(time(timeframe.period, ny_sess,  "America/New_York"))
+in_session = in_ldn or in_ny
+
+bgcolor(in_ldn and not in_ny ? color.new(color.blue,   92) : na, title = "London")
+bgcolor(in_ny  and not in_ldn ? color.new(color.orange, 92) : na, title = "New York")
+bgcolor(in_ldn and in_ny      ? color.new(color.purple, 88) : na, title = "LDN+NY Overlap")
+
+// ─────────────────────────────────────────────────────────────
+// ░░  ATR  (needed early for zone sizing)
+// ─────────────────────────────────────────────────────────────
+
+atr_val = ta.atr(atr_len)
+
+// ─────────────────────────────────────────────────────────────
+// ░░  4H DATA — BIAS
+// ─────────────────────────────────────────────────────────────
+
+h4_hi    = request.security(syminfo.tickerid, "240", ta.highest(high, sr_look), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+h4_lo    = request.security(syminfo.tickerid, "240", ta.lowest(low,   sr_look), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+h4_cls   = request.security(syminfo.tickerid, "240", close,                      gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// ══════════════════════════════════════════════════════════
+// CRITICAL FIX: Use ta.highest/lowest for S&R
+// These are ALWAYS in correct order: h4_hi > h4_lo
+// Pivot-based approach caused demand > supply inversion bug
+// ══════════════════════════════════════════════════════════
+
+sr_res = h4_hi   // resistance = top of 4H range → ALWAYS the highest level
+sr_sup = h4_lo   // support    = bottom of 4H range → ALWAYS the lowest level
+// sr_res is GUARANTEED > sr_sup. No more inverted zones.
+
+h4_mid     = (sr_res + sr_sup) / 2
+bias_bull  = h4_cls > h4_mid         // 4H close above midpoint = bullish
+bias_bear  = h4_cls < h4_mid         // 4H close below midpoint = bearish
+daily_bias = bias_bull ? 1 : bias_bear ? -1 : 0
+
+// 4H S&R dashed lines
+var line res_line = na
+var line sup_line = na
+
+if show_sr and barstate.islast
+    line.delete(res_line)
+    line.delete(sup_line)
+    // Red dashed = RESISTANCE (always at top)
+    res_line := line.new(bar_index - sr_look, sr_res, bar_index + 25, sr_res,
+                         color = color.new(color.red, 20), width = 2, style = line.style_dashed)
+    // Green dashed = SUPPORT (always at bottom, below red)
+    sup_line := line.new(bar_index - sr_look, sr_sup, bar_index + 25, sr_sup,
+                         color = color.new(color.lime, 20), width = 2, style = line.style_dashed)
+
+// ─────────────────────────────────────────────────────────────
+// ░░  SUPPLY & DEMAND ZONES
+// ─────────────────────────────────────────────────────────────
+// FIXED: Supply is built from sr_res (4H highest) — ALWAYS at top
+//        Demand is built from sr_sup (4H lowest)  — ALWAYS at bottom
+//        These can NEVER overlap or invert.
+
+zone_h      = atr_val * zone_atr_mult
+
+// Demand zone — band around the 4H SUPPORT level (bottom)
+demand_top  = sr_sup + zone_h          // slightly above the 4H low
+demand_bot  = sr_sup - zone_h * 0.4   // slightly below the 4H low
+
+// Supply zone — band around the 4H RESISTANCE level (top)
+supply_top  = sr_res + zone_h * 0.4   // slightly above the 4H high
+supply_bot  = sr_res - zone_h          // slightly below the 4H high
+
+// Safety guard: if zones ever touch, expand them apart
+// (Should never happen with this method, but defensive coding)
+demand_top  := math.min(demand_top, h4_mid - zone_h)
+supply_bot  := math.max(supply_bot, h4_mid + zone_h)
+
+// Draw zones (only on last bar, then redraw cleanly)
+var box demand_box = na
+var box supply_box = na
+
+if barstate.islast
+    box.delete(demand_box)
+    box.delete(supply_box)
+
+    // Green demand zone — ALWAYS at bottom of range
+    demand_box := box.new(bar_index - sr_look, demand_top, bar_index + 25, demand_bot,
+                          border_color = color.new(color.lime, 15),
+                          bgcolor      = color.new(color.lime, 80),
+                          border_width = 1)
+
+    // Red supply zone — ALWAYS at top of range
+    supply_box := box.new(bar_index - sr_look, supply_top, bar_index + 25, supply_bot,
+                          border_color = color.new(color.red, 15),
+                          bgcolor      = color.new(color.red, 80),
+                          border_width = 1)
+
+// Is price currently inside each zone?
+in_demand = close >= demand_bot and close <= demand_top
+in_supply = close >= supply_bot and close <= supply_top
+
+// ─────────────────────────────────────────────────────────────
+// ░░  EMA — INTERNAL ONLY (zero plots on chart)
+// ─────────────────────────────────────────────────────────────
+
+ema9   = ta.ema(close, ema_f)
+ema21  = ta.ema(close, ema_m)
+ema50  = ta.ema(close, ema_s)
+ema200 = ta.ema(close, 200)
+
+// Trend alignment checks (used in signal logic only)
+ema_bull = ema9 > ema21 and close > ema50   // bullish EMA stack
+ema_bear = ema9 < ema21 and close < ema50   // bearish EMA stack
+
+// ─────────────────────────────────────────────────────────────
+// ░░  RSI — INTERNAL ONLY
+// ─────────────────────────────────────────────────────────────
+
+rsi_val    = ta.rsi(close, rsi_len)
+rsi_bull   = rsi_val > 50   // above 50 = bullish momentum
+rsi_bear   = rsi_val < 50   // below 50 = bearish momentum
+
+// ─────────────────────────────────────────────────────────────
+// ░░  VOLUME FILTER
+// ─────────────────────────────────────────────────────────────
+
+vol_ma    = ta.sma(volume, vol_len)
+vol_ratio = volume / vol_ma
+vol_ok    = vol_ratio >= vol_thresh
+
+// ─────────────────────────────────────────────────────────────
+// ░░  CANDLE STRUCTURE (confirmation patterns)
+// ─────────────────────────────────────────────────────────────
+
+// Break of structure
+prev_sh = ta.highest(high[1], 12)
+prev_sl = ta.lowest(low[1],   12)
+bos_up  = close > prev_sh           // close above recent swing high
+bos_dn  = close < prev_sl           // close below recent swing low
+
+// Engulfing candle
+bull_eng = close > open and close > high[1] and open < close[1]
+bear_eng = close < open and close < low[1]  and open > close[1]
+
+// Strong momentum candle (body > 60% of ATR)
+bull_mom = close > open and (close - open) > atr_val * 0.4
+bear_mom = close < open and (open - close) > atr_val * 0.4
+
+// Confirmation: any one of the above
+conf_bull = bos_up or bull_eng or bull_mom
+conf_bear = bos_dn or bear_eng or bear_mom
+
+// ─────────────────────────────────────────────────────────────
+// ░░  FIBONACCI + GOLDEN POCKET
+// ─────────────────────────────────────────────────────────────
+
+fib_hi  = ta.highest(high, fib_look)
+fib_lo  = ta.lowest(low,   fib_look)
+fib_rng = fib_hi - fib_lo
+
+// For LONG entries: GP is a pullback from the high (0.618–0.65 down from top)
+gp_long_top = fib_hi - fib_rng * 0.618
+gp_long_bot = fib_hi - fib_rng * 0.650
+in_gp_long  = close <= gp_long_top and close >= gp_long_bot
+
+// For SHORT entries: GP is a bounce from the low (0.618–0.65 up from bottom)
+gp_short_bot = fib_lo + fib_rng * 0.618
+gp_short_top = fib_lo + fib_rng * 0.650
+in_gp_short  = close >= gp_short_bot and close <= gp_short_top
+
+fib_382 = fib_hi - fib_rng * 0.382
+fib_500 = fib_hi - fib_rng * 0.500
+fib_786 = fib_hi - fib_rng * 0.786
+
+// Draw fib lines
+var line[] fl = array.new<line>()
+var label[] lb = array.new<label>()
+
+if show_fibs and barstate.islast
+    for x in fl
+        line.delete(x)
+    for x in lb
+        label.delete(x)
+    array.clear(fl)
+    array.clear(lb)
+    array.push(fl, line.new(bar_index - fib_look, fib_382, bar_index + 5, fib_382,
+               color = color.new(color.teal, 40), style = line.style_dotted))
+    array.push(lb, label.new(bar_index + 6, fib_382, "0.382",
+               color = color.new(color.teal, 60), textcolor = color.teal,
+               style = label.style_label_left, size = size.tiny))
+    array.push(fl, line.new(bar_index - fib_look, fib_500, bar_index + 5, fib_500,
+               color = color.new(color.silver, 40), style = line.style_dotted))
+    array.push(lb, label.new(bar_index + 6, fib_500, "0.500",
+               color = color.new(color.gray, 60), textcolor = color.silver,
+               style = label.style_label_left, size = size.tiny))
+    array.push(fl, line.new(bar_index - fib_look, gp_long_top, bar_index + 5, gp_long_top,
+               color = color.new(color.yellow, 20), style = line.style_dotted, width = 2))
+    array.push(lb, label.new(bar_index + 6, gp_long_top, "0.618 GP",
+               color = color.new(color.yellow, 40), textcolor = color.yellow,
+               style = label.style_label_left, size = size.tiny))
+    array.push(fl, line.new(bar_index - fib_look, fib_786, bar_index + 5, fib_786,
+               color = color.new(color.purple, 40), style = line.style_dotted))
+    array.push(lb, label.new(bar_index + 6, fib_786, "0.786",
+               color = color.new(color.purple, 60), textcolor = color.purple,
+               style = label.style_label_left, size = size.tiny))
+
+// Golden Pocket box — LONG version (below current price area)
+var box gp_box_long  = na
+var box gp_box_short = na
+if show_gp and barstate.islast
+    box.delete(gp_box_long)
+    box.delete(gp_box_short)
+    gp_box_long  := box.new(bar_index - fib_look, gp_long_top, bar_index + 8, gp_long_bot,
+                             border_color = color.new(color.yellow, 20),
+                             bgcolor      = color.new(color.yellow, 80),
+                             border_width = 1)
+    gp_box_short := box.new(bar_index - fib_look, gp_short_top, bar_index + 8, gp_short_bot,
+                             border_color = color.new(color.yellow, 20),
+                             bgcolor      = color.new(color.yellow, 78),
+                             border_width = 1)
+
+// ─────────────────────────────────────────────────────────────
+// ░░  GOLDEN POCKET CONFIRMATION SYSTEM
+// ─────────────────────────────────────────────────────────────
+//  How it works:
+//  Step 1: Price enters the GP zone → "arm" the GP
+//  Step 2: Wait up to N bars for a confirmation candle
+//  Step 3: If confirmation fires in direction of bias → use as signal trigger
+//  Step 4: After signal or N bars pass → disarm
+
+var bool gp_armed_long  = false    // GP armed for a LONG setup
+var bool gp_armed_short = false    // GP armed for a SHORT setup
+var int  gp_arm_bar     = 0        // bar when GP was armed
+
+// ARM: price just entered the long GP zone during session, bias is bullish
+if in_gp_long and not in_gp_long[1] and in_session and daily_bias == 1
+    gp_armed_long  := true
+    gp_arm_bar     := bar_index
+
+// ARM: price just entered the short GP zone during session, bias is bearish
+if in_gp_short and not in_gp_short[1] and in_session and daily_bias == -1
+    gp_armed_short := true
+    gp_arm_bar     := bar_index
+
+// DISARM: too many bars have passed without confirmation
+gp_timeout = (bar_index - gp_arm_bar) > gp_confirm_bars
+if gp_timeout
+    gp_armed_long  := false
+    gp_armed_short := false
+
+// CONFIRMATION: a valid reversal candle fires while GP is armed
+gp_long_confirmed  = gp_armed_long  and conf_bull and vol_ok and in_session
+gp_short_confirmed = gp_armed_short and conf_bear and vol_ok and in_session
+
+// Disarm after confirmation (signal will be generated below)
+if gp_long_confirmed
+    gp_armed_long  := false
+if gp_short_confirmed
+    gp_armed_short := false
+
+// ─────────────────────────────────────────────────────────────
+// ░░  SESSION SIGNAL COUNTER (max signals per session)
+// ─────────────────────────────────────────────────────────────
+
+var int  sess_count  = 0
+var bool prev_sess   = false
+
+// Detect new session start → reset counter
+new_session = in_session and not prev_sess
+if new_session
+    sess_count := 0
+prev_sess := in_session
+
+under_limit = sess_count < max_per_sess
+
+// ─────────────────────────────────────────────────────────────
+// ░░  SIGNAL COOLDOWN
+// ─────────────────────────────────────────────────────────────
+
+var int last_sig_bar = 0
+cd_ok = (bar_index - last_sig_bar) >= cooldown
+
+// ─────────────────────────────────────────────────────────────
+// ░░  MASTER SIGNAL CONDITIONS
+// ─────────────────────────────────────────────────────────────
+//
+//  LONG needs ALL of:
+//   ✓ Active session (London or NY only)
+//   ✓ 4H bias = BULLISH
+//   ✓ EMA bullish alignment
+//   ✓ RSI above 50
+//   ✓ Volume confirmed
+//   ✓ Price in DEMAND zone  OR  Golden Pocket confirmed
+//   ✓ Confirmation candle (if zone entry, not GP — GP has its own confirmation)
+//   ✓ Cooldown OK
+//   ✓ Under session signal limit
+//   ✓ Not inside supply zone (no counter-trend trades)
+
+zone_long = in_demand and conf_bull    // zone entry + confirmation candle
+gp_long   = gp_long_confirmed          // GP: already confirmed above
+
+long_signal_raw = in_session
+                  and daily_bias == 1
+                  and ema_bull
+                  and rsi_bull
+                  and vol_ok
+                  and (zone_long or gp_long)
+                  and not in_supply
+                  and cd_ok
+                  and under_limit
+                  and barstate.isconfirmed
+
+//  SHORT needs ALL of:
+zone_short = in_supply and conf_bear
+gp_short   = gp_short_confirmed
+
+short_signal_raw = in_session
+                   and daily_bias == -1
+                   and ema_bear
+                   and rsi_bear
+                   and vol_ok
+                   and (zone_short or gp_short)
+                   and not in_demand
+                   and cd_ok
+                   and under_limit
+                   and barstate.isconfirmed
+
+// Edge detection — fire once per signal event
+long_signal  = long_signal_raw  and not long_signal_raw[1]
+short_signal = short_signal_raw and not short_signal_raw[1]
+
+// Update cooldown + session counter
+if long_signal or short_signal
+    last_sig_bar := bar_index
+    sess_count   := sess_count + 1
+
+// ─────────────────────────────────────────────────────────────
+// ░░  TP / SL LEVELS
+// ─────────────────────────────────────────────────────────────
+
+sl_dist  = atr_val * atr_sl
+tp_m     = rr_mode == "1:2" ? 2.0 : 4.0
+tp1_m    = rr_mode == "1:2" ? 1.0 : 2.0
+bw       = 45   // box width in bars
+
+// LONG levels
+l_entry  = close
+l_sl     = l_entry - sl_dist
+l_tp1    = l_entry + sl_dist * tp1_m
+l_tp2    = l_entry + sl_dist * tp_m
+
+// SHORT levels
+s_entry  = close
+s_sl     = s_entry + sl_dist
+s_tp1    = s_entry - sl_dist * tp1_m
+s_tp2    = s_entry - sl_dist * tp_m
+
+// ─────────────────────────────────────────────────────────────
+// ░░  GAINZALGO V2 SIGNAL RENDERING
+// ─────────────────────────────────────────────────────────────
+
+if long_signal
+    // ── Main BUY label (large, green) ──
+    label.new(bar_index, low - atr_val * 1.5,
+              "BUY",
+              color     = color.new(color.lime, 0),
+              textcolor = color.black,
+              style     = label.style_label_up,
+              size      = size.large)
+
+    // ── Entry line + label ──
+    line.new(bar_index, l_entry, bar_index + bw, l_entry,
+             color = color.new(color.white, 20), width = 1, style = line.style_dashed)
+    label.new(bar_index + bw + 1, l_entry,
+              "ENTRY  " + str.tostring(l_entry, "#.00"),
+              color = color.new(color.white, 25), textcolor = color.black,
+              style = label.style_label_left, size = size.small)
+
+    // ── Green profit box (entry → TP2) ──
+    if show_boxes
+        box.new(bar_index, l_tp2, bar_index + bw, l_entry,
+                border_color = color.new(color.lime, 20),
+                bgcolor      = color.new(color.lime, 78),
+                border_width = 1)
+
+    // ── Red risk box (SL → entry) ──
+    if show_boxes
+        box.new(bar_index, l_entry, bar_index + bw, l_sl,
+                border_color = color.new(color.red, 20),
+                bgcolor      = color.new(color.red, 78),
+                border_width = 1)
+
+    // ── TP1 dashed line ──
+    line.new(bar_index, l_tp1, bar_index + bw, l_tp1,
+             color = color.new(color.lime, 15), width = 1, style = line.style_dashed)
+    label.new(bar_index + bw + 1, l_tp1,
+              "TP1  " + str.tostring(l_tp1, "#.00"),
+              color = color.new(color.lime, 20), textcolor = color.lime,
+              style = label.style_label_left, size = size.small)
+
+    // ── TP2 solid line ──
+    line.new(bar_index, l_tp2, bar_index + bw, l_tp2,
+             color = color.new(color.lime, 0), width = 2, style = line.style_solid)
+    label.new(bar_index + bw + 1, l_tp2,
+              "TP2  " + str.tostring(l_tp2, "#.00"),
+              color = color.new(color.lime, 10), textcolor = color.white,
+              style = label.style_label_left, size = size.small)
+
+    // ── SL solid line ──
+    line.new(bar_index, l_sl, bar_index + bw, l_sl,
+             color = color.new(color.red, 0), width = 2, style = line.style_solid)
+    label.new(bar_index + bw + 1, l_sl,
+              "SL  " + str.tostring(l_sl, "#.00"),
+              color = color.new(color.red, 10), textcolor = color.white,
+              style = label.style_label_left, size = size.small)
+
+if short_signal
+    // ── Main SELL label ──
+    label.new(bar_index, high + atr_val * 1.5,
+              "SELL",
+              color     = color.new(color.red, 0),
+              textcolor = color.white,
+              style     = label.style_label_down,
+              size      = size.large)
+
+    // ── Entry line + label ──
+    line.new(bar_index, s_entry, bar_index + bw, s_entry,
+             color = color.new(color.white, 20), width = 1, style = line.style_dashed)
+    label.new(bar_index + bw + 1, s_entry,
+              "ENTRY  " + str.tostring(s_entry, "#.00"),
+              color = color.new(color.white, 25), textcolor = color.black,
+              style = label.style_label_left, size = size.small)
+
+    // ── Green profit box (TP2 → entry) ──
+    if show_boxes
+        box.new(bar_index, s_entry, bar_index + bw, s_tp2,
+                border_color = color.new(color.lime, 20),
+                bgcolor      = color.new(color.lime, 78),
+                border_width = 1)
+
+    // ── Red risk box (entry → SL) ──
+    if show_boxes
+        box.new(bar_index, s_sl, bar_index + bw, s_entry,
+                border_color = color.new(color.red, 20),
+                bgcolor      = color.new(color.red, 78),
+                border_width = 1)
+
+    // ── TP1 dashed ──
+    line.new(bar_index, s_tp1, bar_index + bw, s_tp1,
+             color = color.new(color.lime, 15), width = 1, style = line.style_dashed)
+    label.new(bar_index + bw + 1, s_tp1,
+              "TP1  " + str.tostring(s_tp1, "#.00"),
+              color = color.new(color.lime, 20), textcolor = color.lime,
+              style = label.style_label_left, size = size.small)
+
+    // ── TP2 solid ──
+    line.new(bar_index, s_tp2, bar_index + bw, s_tp2,
+             color = color.new(color.lime, 0), width = 2, style = line.style_solid)
+    label.new(bar_index + bw + 1, s_tp2,
+              "TP2  " + str.tostring(s_tp2, "#.00"),
+              color = color.new(color.lime, 10), textcolor = color.white,
+              style = label.style_label_left, size = size.small)
+
+    // ── SL solid ──
+    line.new(bar_index, s_sl, bar_index + bw, s_sl,
+             color = color.new(color.red, 0), width = 2, style = line.style_solid)
+    label.new(bar_index + bw + 1, s_sl,
+              "SL  " + str.tostring(s_sl, "#.00"),
+              color = color.new(color.red, 10), textcolor = color.white,
+              style = label.style_label_left, size = size.small)
+
+// ─────────────────────────────────────────────────────────────
+// ░░  PLOTSHAPE — Arrows on bars (GainzAlgo style)
+// ─────────────────────────────────────────────────────────────
+
+plotshape(long_signal,
+          title    = "BUY",
+          location = location.belowbar,
+          style    = shape.triangleup,
+          size     = size.huge,
+          color    = color.new(color.lime, 0),
+          text     = "BUY")
+
+plotshape(short_signal,
+          title    = "SELL",
+          location = location.abovebar,
+          style    = shape.triangledown,
+          size     = size.huge,
+          color    = color.new(color.red, 0),
+          text     = "SELL")
+
+barcolor(long_signal  ? color.new(color.lime, 25) : na)
+barcolor(short_signal ? color.new(color.red,  25) : na)
+
+// ─────────────────────────────────────────────────────────────
+// ░░  GP WAITING INDICATOR — tells beginner to watch for confirm
+// ─────────────────────────────────────────────────────────────
+
+// Small label when GP is armed but not yet confirmed
+plotshape(gp_armed_long and not long_signal and in_session,
+          title    = "GP Armed Long",
+          location = location.belowbar,
+          style    = shape.circle,
+          size     = size.small,
+          color    = color.new(color.yellow, 20))
+
+plotshape(gp_armed_short and not short_signal and in_session,
+          title    = "GP Armed Short",
+          location = location.abovebar,
+          style    = shape.circle,
+          size     = size.small,
+          color    = color.new(color.yellow, 20))
+
+// ─────────────────────────────────────────────────────────────
+// ░░  TRAP WARNINGS — max one per 30 bars
+// ─────────────────────────────────────────────────────────────
+
+var int last_trap = 0
+trap_cd = (bar_index - last_trap) >= 30
+
+bos_up_now   = close > ta.highest(high[1], 12)
+bos_dn_now   = close < ta.lowest(low[1],   12)
+low_vol      = vol_ratio < 0.85
+
+bull_trap = bos_up_now and low_vol and in_session and trap_cd and not long_signal
+bear_trap = bos_dn_now and low_vol and in_session and trap_cd and not short_signal
+
+if bull_trap
+    last_trap := bar_index
+    label.new(bar_index, high + atr_val * 0.5, "TRAP",
+              color = color.new(color.orange, 15), textcolor = color.white,
+              style = label.style_label_down, size = size.small)
+
+if bear_trap
+    last_trap := bar_index
+    label.new(bar_index, low - atr_val * 0.5, "TRAP",
+              color = color.new(color.orange, 15), textcolor = color.white,
+              style = label.style_label_up, size = size.small)
+
+// ─────────────────────────────────────────────────────────────
+// ░░  DASHBOARD — Professional Table Version
+// ─────────────────────────────────────────────────────────────
+
+var table dash_tbl = table.new(position.top_right, 2, 9, 
+     bgcolor      = color.new(color.black, 20), 
+     border_color = color.new(color.gray, 50), 
+     border_width = 1, 
+     frame_color  = color.new(color.gray, 50), 
+     frame_width  = 1)
+
+if barstate.islast
+    // 1. BIAS Logic
+    bias_txt = daily_bias ==  1 ? "BULLISH" :
+               daily_bias == -1 ? "BEARISH" : "NEUTRAL"
+    bias_col = daily_bias ==  1 ? color.lime :
+               daily_bias == -1 ? color.red  : color.gray
+
+    // 2. SESSION Logic
+    sess_txt = in_ldn and in_ny ? "LDN+NY" :
+               in_ldn           ? "LONDON" :
+               in_ny            ? "NEW YORK" : "OFF"
+    sess_col = in_session ? color.lime : color.gray
+
+    // 3. EMA Logic
+    ema_txt  = ema_bull ? "BULLISH" : ema_bear ? "BEARISH" : "NEUTRAL"
+    ema_col  = ema_bull ? color.lime : ema_bear ? color.red : color.gray
+
+    // 4. RSI Logic
+    rsi_txt  = str.tostring(math.round(rsi_val * 10) / 10, "#.#")
+    rsi_col  = rsi_val > 60 ? color.lime : rsi_val < 40 ? color.red : color.white
+
+    // 5. VOLUME Logic
+    vol_txt  = vol_ok ? "HIGH" : "LOW"
+    vol_col  = vol_ok ? color.lime : color.orange
+
+    // 6. SIGNAL Logic
+    sig_txt  = long_signal_raw ? "BUY" : short_signal_raw ? "SELL" : "WAIT"
+    sig_col  = long_signal_raw ? color.lime : short_signal_raw ? color.red : color.white
+
+    // 7. CONFIDENCE Logic (Calculated based on met conditions)
+    float conf_score = 0
+    if daily_bias == (long_signal_raw or daily_bias == 1 ? 1 : -1)
+        conf_score += 20
+    if (daily_bias == 1 and ema_bull) or (daily_bias == -1 and ema_bear)
+        conf_score += 20
+    if (daily_bias == 1 and rsi_bull) or (daily_bias == -1 and rsi_bear)
+        conf_score += 20
+    if vol_ok
+        conf_score += 20
+    if (daily_bias == 1 and (in_demand or in_gp_long)) or (daily_bias == -1 and (in_supply or in_gp_short))
+        conf_score += 20
+    
+    conf_txt = str.tostring(conf_score) + "%"
+    conf_col = conf_score >= 80 ? color.lime : conf_score >= 60 ? color.yellow : color.red
+
+    // 8. RATING Logic
+    rat_txt  = conf_score >= 90 ? "★★★★★" :
+               conf_score >= 70 ? "★★★★☆" :
+               conf_score >= 50 ? "★★★☆☆" :
+               conf_score >= 30 ? "★★☆☆☆" : "★☆☆☆☆"
+    rat_col  = conf_col
+
+    // Header
+    table.cell(dash_tbl, 0, 0, "XAUUSD PRO V3", text_color = color.white, text_size = size.small, bgcolor = color.new(color.blue, 30))
+    table.merge_cells(dash_tbl, 0, 0, 1, 0)
+
+    // Data Rows
+    // BIAS
+    table.cell(dash_tbl, 0, 1, "BIAS",      text_color = color.white, text_halign = text.align_left,  text_size = size.small)
+    table.cell(dash_tbl, 1, 1, bias_txt,  text_color = bias_col,   text_halign = text.align_right, text_size = size.small)
+    // RSI
+    table.cell(dash_tbl, 0, 2, "RSI",       text_color = color.white, text_halign = text.align_left,  text_size = size.small)
+    table.cell(dash_tbl, 1, 2, rsi_txt,   text_color = rsi_col,    text_halign = text.align_right, text_size = size.small)
+    // EMA
+    table.cell(dash_tbl, 0, 3, "EMA",       text_color = color.white, text_halign = text.align_left,  text_size = size.small)
+    table.cell(dash_tbl, 1, 3, ema_txt,   text_color = ema_col,    text_halign = text.align_right, text_size = size.small)
+    // VOLUME
+    table.cell(dash_tbl, 0, 4, "VOLUME",    text_color = color.white, text_halign = text.align_left,  text_size = size.small)
+    table.cell(dash_tbl, 1, 4, vol_txt,   text_color = vol_col,    text_halign = text.align_right, text_size = size.small)
+    // SESSION
+    table.cell(dash_tbl, 0, 5, "SESSION",   text_color = color.white, text_halign = text.align_left,  text_size = size.small)
+    table.cell(dash_tbl, 1, 5, sess_txt,   text_color = sess_col,   text_halign = text.align_right, text_size = size.small)
+    // TRADE SIGNAL
+    table.cell(dash_tbl, 0, 6, "SIGNAL",    text_color = color.white, text_halign = text.align_left,  text_size = size.small)
+    table.cell(dash_tbl, 1, 6, sig_txt,   text_color = sig_col,    text_halign = text.align_right, text_size = size.small)
+    // CONFIDENCE
+    table.cell(dash_tbl, 0, 7, "CONFIDENCE",text_color = color.white, text_halign = text.align_left,  text_size = size.small)
+    table.cell(dash_tbl, 1, 7, conf_txt,   text_color = conf_col,   text_halign = text.align_right, text_size = size.small)
+    // RATING
+    table.cell(dash_tbl, 0, 8, "RATING",    text_color = color.white, text_halign = text.align_left,  text_size = size.small)
+    table.cell(dash_tbl, 1, 8, rat_txt,   text_color = rat_col,    text_halign = text.align_right, text_size = size.small)
+
+// ─────────────────────────────────────────────────────────────
+// ░░  ALERTS
+// ─────────────────────────────────────────────────────────────
+
+alertcondition(long_signal,  title = "BUY Signal",
+               message = "XAUUSD BUY | Entry: {{close}} | Check chart for TP1, TP2 and SL.")
+alertcondition(short_signal, title = "SELL Signal",
+               message = "XAUUSD SELL | Entry: {{close}} | Check chart for TP1, TP2 and SL.")
+alertcondition(gp_long_confirmed,  title = "GP Long Confirmed",
+               message = "Golden Pocket LONG confirmed on XAUUSD — signal firing now.")
+alertcondition(gp_short_confirmed, title = "GP Short Confirmed",
+               message = "Golden Pocket SHORT confirmed on XAUUSD — signal firing now.")
+alertcondition(bull_trap, title = "Bull Trap Warning",
+               message = "XAUUSD Possible Bull Trap — low volume breakout. Do NOT buy.")
+alertcondition(bear_trap, title = "Bear Trap Warning",
+               message = "XAUUSD Possible Bear Trap — low volume breakdown. Do NOT sell.")
